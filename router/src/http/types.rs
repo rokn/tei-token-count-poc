@@ -561,6 +561,29 @@ pub(crate) struct SimpleToken {
 pub(crate) struct TokenizeResponse(pub Vec<Vec<SimpleToken>>);
 
 #[derive(Deserialize, ToSchema)]
+pub(crate) struct TokenCountRequest {
+    pub inputs: TokenizeInput,
+    #[serde(default = "default_add_special_tokens")]
+    #[schema(default = "true", example = "true")]
+    pub add_special_tokens: bool,
+    /// The name of the prompt that should be used by for encoding. If not set, no prompt
+    /// will be applied.
+    ///
+    /// Must be a key in the `sentence-transformers` configuration `prompts` dictionary.
+    ///
+    /// For example if ``prompt_name`` is "query" and the ``prompts`` is {"query": "query: ", ...},
+    /// then the sentence "What is the capital of France?" will be encoded as
+    /// "query: What is the capital of France?" because the prompt text will be prepended before
+    /// any text to encode.
+    #[schema(default = "null", example = "null", nullable = true)]
+    pub prompt_name: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[schema(example = json!([42]))]
+pub(crate) struct TokenCountResponse(pub Vec<usize>);
+
+#[derive(Deserialize, ToSchema)]
 #[serde(untagged)]
 pub(crate) enum InputIds {
     Single(Vec<u32>),

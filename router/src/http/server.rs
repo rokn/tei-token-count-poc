@@ -5,9 +5,9 @@ use crate::http::types::{
     OpenAICompatEmbedding, OpenAICompatErrorResponse, OpenAICompatRequest, OpenAICompatResponse,
     OpenAICompatUsage, PredictInput, PredictRequest, PredictResponse, Prediction, Rank,
     RerankRequest, RerankResponse, Sequence, SimilarityInput, SimilarityParameters,
-    SimilarityRequest, SimilarityResponse, SimpleToken, SparseValue, TokenizeInput,
-    TokenizeRequest, TokenizeResponse, TruncationDirection, VertexPrediction, VertexRequest,
-    VertexResponse,
+    SimilarityRequest, SimilarityResponse, SimpleToken, SparseValue, TokenCountRequest,
+    TokenCountResponse, TokenizeInput, TokenizeRequest, TokenizeResponse, TruncationDirection,
+    VertexPrediction, VertexRequest, VertexResponse,
 };
 use crate::{
     logging, shutdown, ClassifierModel, EmbeddingModel, ErrorResponse, ErrorType, Info, ModelType,
@@ -1407,6 +1407,112 @@ async fn tokenize(
     Ok(Json(TokenizeResponse(tokens)))
 }
 
+/// Get token counts for inputs
+#[utoipa::path(
+post,
+tag = "Text Embeddings Inference",
+path = "/token_count",
+request_body = TokenCountRequest,
+responses(
+(status = 200, description = "Token counts", body = TokenCountResponse),
+(status = 413, description = "Batch size error", body = ErrorResponse,
+example = json ! ({"error": "Batch size error", "error_type": "batch_size"})),
+(status = 422, description = "Tokenization error", body = ErrorResponse,
+example = json ! ({"error": "Tokenization error", "error_type": "tokenizer"})),
+(status = 424, description = "Embedding Error", body = ErrorResponse,
+example = json ! ({"error": "Inference failed", "error_type": "backend"})),
+),
+)]
+#[instrument(skip_all)]
+async fn token_count(
+    infer: Extension<Infer>,
+    info: Extension<Info>,
+    Json(req): Json<TokenCountRequest>,
+) -> Result<Json<TokenCountResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let token_count_inner = move |input: String,
+                                  add_special_tokens: bool,
+                                  prompt_name: Option<String>,
+                                  infer: Infer| async move {
+        let (encoded_input, encoding) = infer
+            .tokenize(input.clone(), add_special_tokens, prompt_name)
+            .await
+            .map_err(ErrorResponse::from)?;
+        let input = encoded_input.unwrap_or(input);
+
+        let tokens: Vec<SimpleToken> = into_tokens(encoding, &input)
+            .into_iter()
+            .map(|t| {
+                let CoreSimpleToken {
+                    id,
+                    text,
+                    special,
+                    start,
+                    stop,
+                } = t;
+                SimpleToken {
+                    id,
+                    text,
+                    special,
+                    start,
+                    stop,
+                }
+            })
+            .collect();
+        Ok::<usize, ErrorResponse>(tokens.len())
+    };
+
+    let token_counts = match req.inputs {
+        TokenizeInput::Single(input) => {
+            vec![token_count_inner(input, req.add_special_tokens, req.prompt_name, infer.0).await?]
+        }
+        TokenizeInput::Batch(inputs) => {
+            if inputs.is_empty() {
+                let message = "`inputs` cannot be empty".to_string();
+                tracing::error!("{message}");
+                let err = ErrorResponse {
+                    error: message,
+                    error_type: ErrorType::Empty,
+                };
+                let counter = metrics::counter!("te_request_failure", "err" => "validation");
+                counter.increment(1);
+                Err(err)?;
+            }
+
+            let batch_size = inputs.len();
+            if batch_size > info.max_client_batch_size {
+                let message = format!(
+                    "batch size {batch_size} > maximum allowed batch size {}",
+                    info.max_client_batch_size
+                );
+                tracing::error!("{message}");
+                let err = ErrorResponse {
+                    error: message,
+                    error_type: ErrorType::Validation,
+                };
+                let counter = metrics::counter!("te_request_failure", "err" => "batch_size");
+                counter.increment(1);
+                Err(err)?;
+            }
+
+            let mut futures = Vec::with_capacity(batch_size);
+            for input in inputs {
+                futures.push(token_count_inner(
+                    input,
+                    req.add_special_tokens,
+                    req.prompt_name.clone(),
+                    infer.0.clone(),
+                ));
+            }
+
+            join_all(futures)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<usize>, ErrorResponse>>()?
+        }
+    };
+    Ok(Json(TokenCountResponse(token_counts)))
+}
+
 /// Decode input ids
 #[utoipa::path(
 post,
@@ -1619,6 +1725,7 @@ pub async fn run(
     openai_embed,
     similarity,
     tokenize,
+    token_count,
     decode,
     metrics,
     ),
@@ -1654,6 +1761,8 @@ pub async fn run(
     TokenizeInput,
     TokenizeRequest,
     TokenizeResponse,
+    TokenCountRequest,
+    TokenCountResponse,
     TruncationDirection,
     SimilarityInput,
     SimilarityParameters,
@@ -1740,6 +1849,7 @@ pub async fn run(
         .route("/rerank", post(rerank))
         .route("/similarity", post(similarity))
         .route("/tokenize", post(tokenize))
+        .route("/token_count", post(token_count))
         .route("/decode", post(decode))
         // OpenAI compat route
         .route("/embeddings", post(openai_embed))
